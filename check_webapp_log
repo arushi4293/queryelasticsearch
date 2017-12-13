@@ -1,0 +1,279 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Getopt::Long;
+use LWP::UserAgent;
+use JSON;
+
+my %error_types = (
+	"eas-auth-errors" => "host: eas* AND message: AUTHENTICATIONFAILED",
+	"eas-invalidsync-errors" => "host: eas* AND message: InvalidSyncKey",
+	"webmail-5XX-errors" => "app:webmail* AND env:production AND NOT eventtype:heartbeat AND category:errors AND action:[500 TO 599]",
+	"webeditor-5XX-errors" => "app: webeditor AND env: production AND err.name: Error",
+	"filemanager-5XX-errors" => "app:filemanager* AND env:production AND NOT eventtype:heartbeat AND category:errors AND action:[500 TO 599]",
+	"webshopadmin-5XX-errors" => "app: webshopadmin AND err.response.status: [500 TO 599]",
+	"webshopbackend-5XX-errors" => "app: webshopbackend AND err.response.status: [500 TO 599]",
+	"login-5XX-errors" => "app: login AND env: production AND err.name: Error"
+	);
+
+my %index_types = (
+	"eas-auth-errors" => "logstash",
+	"eas-invalidsync-errors" => "logstash",
+	"webmail-5XX-errors" => "webdev",
+	"filemanager-5XX-errors" => "webdev",
+	"webeditor-5XX-errors" => "webdev",
+	"webshopadmin-5XX-errors" => "webdev",
+	"webshopbackend-5XX-errors" => "webdev",
+	"login-5XX-errors" => "webdev",
+);
+
+my %thresholds = (
+	"eas-auth-errors" => "300,500",
+	"eas-invalidsync-errors" => "800,1000",
+	"webmail-5XX-errors" => "150,200",
+	"filemanager-5XX-errors" => "100,200",
+	"webeditor-5XX-errors" => "50,150",
+	"webshopadmin-5XX-errors" => "25,100",
+	"webshopbackend-5XX-errors" => "50,100",
+	"login-5XX-errors" => "50,100",
+);
+
+
+my %critical;
+my %warning;
+
+my $miliseconds=0;
+my $indextype = "logstash";
+my $date = `date +%Y.%m.%d`;
+chomp($date);
+
+my ($time,$help);
+
+
+GetOptions ( "time=s" => \$time,    
+	    "help" => \$help,
+	    "eas-auth-crit=s" => \$critical{"eas-auth-errors"},
+	    "eas-auth-warn=s" => \$warning{"eas-auth-errors"},
+	    "eas-invalidsync-crit=s" => \$critical{"eas-invalidsync-errors"},
+	    "eas-invalidsync-warn=s" => \$warning{"eas-invalidsync-errors"},
+	    "webmail-5XX-crit=s" =>  \$critical{"webmail-5XX-errors"},
+	    "webmail-5XX-warn=s" => \$warning{"webmail-5XX-errors"},
+	    "filemanager-5XX-crit=s" => \$critical{"filemanager-5XX-errors"},
+	    "filemanager-5XX-warn=s" => \$warning{"filemanager-5XX-errors"},
+	    "webeditor-5XX-crit=s" => \$critical{"webeditor-5XX-errors"},
+	    "webeditor-5XX-warn=s" => \$warning{"webeditor-5XX-errors"},
+	    "webshopadmin-5XX-crit=s" => \$critical{"webshopadmin-5XX-errors"},
+	    "webshopadmin-5XX-warn=s" => \$warning{"webshopadmin-5XX-errors"},
+	    "webshopbackend-5XX-crit=s" => \$critical{"webshopbackend-5XX-errors"},
+	    "webshopbackend-5XX-warn=s" => \$warning{"webshopbackend-5XX-errors"},
+	    "login-5XX-crit=s" => \$critical{"login-5XX-errors"},
+	    "login-5XX-warn=s" => \$warning{"login-5XX-errors"},
+	
+
+) 
+or warn("Error in command line arguments\n");
+
+
+if( defined $help ){
+	print "Filters result from current date ($date)\n";
+	print "========================================================================\n";
+	print "THe following options are available:\n";
+	print "1) --time <TIME> => Filter results for mentioned time measured from the current time[10m|3h|50s], Eg: 10m (from past 10mins)\n";
+	print "2) --help => To display this help menu\n";
+
+	my $i = 3;
+	my ($crit,$warn);
+	foreach my $key (keys%error_types){
+		$crit	= $key;
+		$warn = $key;
+		$crit =~ s/errors/crit/;
+		$warn =~ s/errors/warn/;
+		print "$i) --$crit  <CRITICAL-THRESHOLD> => To specify user defined critical threshold for $key\n";
+		$i++;
+		print "$i) --$warn <WARNING-THRESHOLD> => To specify user defined warning threshold for $key\n";
+		$i++;
+	}	
+
+
+	print "\nTHe following <ERROR_TYPE> will be checked\n";
+	foreach my $key (keys%error_types){
+		print "* $key\n";
+	}	
+	print "========================================================================\n";
+	exit;
+}
+
+my $final_status_code = 0;
+foreach my $errortype( sort keys %error_types ){
+	$indextype = $index_types{$errortype};
+	my $errorquery = $error_types{$errortype};
+	my $query_url = "https://kibana.one.com:9200/$indextype-$date/_count?pretty";
+	my $query_data = form_query_data($time,$errorquery);
+	my $count = get_count($query_url,$query_data);
+	my ($code,$msg) = check($errortype,$count);
+	if(defined $msg){
+		print "$msg";
+	}
+	if($code > $final_status_code){
+		$final_status_code = $code;
+	}
+}
+
+if($final_status_code eq "0"){
+	print "All is OK !!\n";
+}
+exit $final_status_code;
+
+
+#FUNCTIONS
+	
+sub check{
+	my $errortype = shift;
+	my $count = shift;
+	my $check_msg;
+	my $status_code;
+	my ($warning,$critical) = split(',',$thresholds{$errortype});
+	if( defined $warning{$errortype}){
+		$warning = $warning{$errortype};
+	}
+	if(defined $critical{$errortype}){
+		$critical = $critical{$errortype};
+	}
+	if($warning !~ m/^\d+$/ || $critical !~ m/^\d+$/){
+		$check_msg = "CRITICAL!! Critical and warning arguments needs to be digits only \n";
+		$status_code = 2;
+	}
+	elsif($count < $warning ){
+		$status_code = 0;
+	}
+	elsif($count >= $warning && $count < $critical){
+		$check_msg = "$errortype:\tWARNING : Count-$count is above thresholds value-$warning\n";
+		$status_code = 1;
+	}
+	elsif($count >= $critical){
+		$check_msg = "$errortype:\tCRITICAL - Count-$count is above threshold value $critical\n";
+		$status_code = 2;
+	}
+	else{
+		$check_msg = "$errortype:\tUNKNOWN $? \n";	
+		$status_code = 3;
+	}
+	return ($status_code, $check_msg);
+}
+
+sub get_count{
+	my $query_url = shift;
+	my $query_data = shift;
+	my $response_json = http_get_request($query_url,$query_data);
+	my $response = from_json($response_json);
+	my $count = $response->{"count"};
+	return $count;
+}
+
+
+sub http_get_request{
+	my $url =shift;
+	my $query_data = shift;
+	my $ua = LWP::UserAgent->new;
+	$ua->credentials("kibana.one.com:9200","Protected Access to OneComElasticSearch","webcheck","one.com123");
+	my $req = HTTP::Request->new(GET => "$url");
+	$req->content($query_data);
+	my $res = $ua->request($req);
+	my $response;
+	if($res->is_success) {
+		$response = $res->content;
+	} 
+	else{
+		my $err = $res->status_line;
+		print "Error in fetching query from logelastic server $url: $err\n";
+		exit 2;
+	}
+	return $response;
+}
+
+sub form_query_data{
+	my $time = shift;
+	my $query = shift;
+	my $query_data;
+if( ! defined $time ){
+	$query_data = <<"END_MSG";
+{
+  "query": {
+    "filtered": {
+      "query": {
+        "query_string": {
+          "query": "$query",
+          "analyze_wildcard": true
+        }
+      } 
+   }
+ }
+}
+END_MSG
+}
+
+else{
+	my $miliseconds = findmiliseconds($time);
+	my $current = `date +%s%N | cut -b1-13`;
+	my $previous = ($current-$miliseconds);
+	$query_data = <<"END_MSG";
+{
+  "query": {
+    "filtered": {
+      "query": {
+        "query_string": {
+          "query": "$query",
+          "analyze_wildcard": true
+        }
+      },
+      "filter": {
+        "bool": {
+          "must": [
+            {
+              "range": {
+                "\@timestamp": {
+                  "gte": $previous,
+                  "lte": $current,
+                  "format": "epoch_millis"
+                }
+              }
+            }
+          ],
+          "must_not": []
+        }
+      }
+    }
+  }
+}
+END_MSG
+}
+return $query_data;
+}
+
+sub findmiliseconds{
+	my $time = shift;
+	my $milisecond;
+	if($time =~ m/(\d+)([m|s|h])/){
+		my $digit = $1;
+		my $letter = $2;
+		if($letter eq "s"){
+			$milisecond = $digit*1000;	
+		}
+		elsif($letter eq "m"){
+			$milisecond = $digit*1000*60;	
+		}
+		elsif($letter eq "h"){
+			$milisecond = $digit*1000*60*60;	
+		}
+		
+	}
+	else{
+		print "Invalid time format in s/m/h: eg- 10m/30s/5h\n";
+		exit 2;
+	}
+	return $milisecond;
+}
+
+
+
